@@ -1,56 +1,114 @@
-from tensorflow.python.ops import rnn, rnn_cell
 import tensorflow as tf
-from wikipedia_input import wiki_producer
-
-
-class Config(object):
-    vocabulary_size = 10000
-    num_steps = 20
-    embedding_size = 150
-    hidden_size = 650
-    num_layers = 2
-    keep_prob = 0.5
-    batch_size = 30
-    learning_rate = 0.0001
-
-
-class WikiInput(object):
-    def __init__(self):
-        self.inputs, self.targets = wiki_producer()
 
 
 class WikiPedia(object):
-    def __init__(self, config, wikiinput):
-        self.learning_rate = config.learning_rate
-        lstm_cell = rnn_cell.BasicLSTMCell(config.hidden_size,
-                                           forget_bias=0.,
-                                           state_is_tuple=True)
-        dropout_cell = rnn_cell.DropoutWrapper(lstm_cell, input_keep_prob=config.keep_prob)
-        cell = rnn_cell.MultiRNNCell(dropout_cell, state_is_tuple=True)
-        with tf.device("/cpu:0"):
-            embedding = tf.get_variable("embedding",
-                                        shape=[config.vocabulary_size, config.embedding_size],
-                                        dtype=tf.float32,
-                                        initializer=tf.truncated_normal_initializer(stddev=0.05))
-        embed = tf.nn.embedding_lookup(embedding, wikiinput.inputs)
-        split = [tf.squeeze(input, squeeze_dims=1) for input in tf.split([1], config.num_steps, embed)]
-        state = cell.zero_state(config.batch_size, dtype=tf.float32)
-        outputs, _ = rnn.rnn(cell=cell,
-                             inputs=split,
-                             initial_state=state)
-        expand = [tf.expand_dims(output, 1) for output in outputs]
-        concat = tf.concat([1], expand)
-        softmax_weight = tf.get_variable("softmax_weight",
-                                         shape=[config.hidden_size, config.vocabulary_size],
-                                         dtype=tf.float32,
-                                         initializer=tf.truncated_normal_initializer(stddev=0.05))
-        softmax_bias = tf.get_variable("softmax_weight",
-                                       shape=[config.vocabulary_size],
-                                       dtype=tf.float32,
-                                       initializer=tf.constant_initializer(0.))
-        logits = tf.nn.xw_plus_b(concat, softmax_weight, softmax_bias)
-        self.loss = tf.nn.sparse_softmax_cross_entropy_with_logits(logits=logits, labels=wikiinput.labels)
+    def __init__(self, inputs):
+        vocab_size = inputs.vocab_size
+        embedding_size = inputs.embedding_size
+        num_units = inputs.num_units
+        learning_rate = inputs.learning_rate
+        with tf.variable_scope("embedding"):
+            embed = tf.get_variable(name="embedding",
+                                    shape=[vocab_size, embedding_size],
+                                    initializer=tf.truncated_normal_initializer(stddev=0.05),
+                                    dtype=tf.float32)
+            lookup = tf.nn.embedding_lookup(embed, inputs.contexts)
+        with tf.variable_scope("rnn"):
+            lstm = tf.nn.rnn_cell.BasicLSTMCell(num_units=num_units, state_is_tuple=True)
+            outputs, _ = tf.nn.dynamic_rnn(cell=lstm,
+                                           inputs=lookup,
+                                           sequence_length=inputs.sequence_lengths,
+                                           dtype=tf.float32)
+            batch_size = outputs.get_shape().as_list()[0]
+            reshape = tf.reshape(outputs, [-1, num_units])
+        with tf.variable_scope("output"):
+            softmax_w = tf.get_variable(name="softmax_w",
+                                        shape=[num_units, vocab_size],
+                                        initializer=tf.truncated_normal_initializer(stddev=0.05),
+                                        dtype=tf.float32)
+            softmax_b = tf.get_variable(name="softmax_b",
+                                        shape=[vocab_size],
+                                        initializer=tf.constant_initializer(value=0.),
+                                        dtype=tf.float32)
+            xw_plus_b = tf.nn.xw_plus_b(reshape, softmax_w, softmax_b)
+            logits = tf.reshape(xw_plus_b, [batch_size, -1, vocab_size])
+        with tf.name_scope("loss"):
+            fake_loss = tf.nn.sparse_softmax_cross_entropy_with_logits(logits=logits, labels=inputs.labels)
+            mask = tf.sign(inputs.labels)
+            loss_per_example_per_step = tf.mul(fake_loss, mask)
+            loss_per_example_sum = tf.reduce_sum(loss_per_example_per_step, reduction_indices=1)
+            loss_per_example_average = tf.div(x=loss_per_example_sum,
+                                              y=tf.cast(inputs.sequence_lengths, tf.float32))
+            self.__loss = tf.reduce_mean(loss_per_example_average, name="loss")
+        with tf.name_scope("train"):
+            optimizer = tf.train.AdamOptimizer(learning_rate=learning_rate)
+            self.__train_op = optimizer.minimize(self.__loss)
 
-    def train(self):
-        optimizer = tf.train.GradientDescentOptimizer(learning_rate=self.learning_rate)
-        return optimizer
+    @property
+    def loss(self):
+        return self.__loss
+
+    @property
+    def train_op(self):
+        return self.__train_op
+
+
+# This class is nearly the same as the former one except that this one calculate the loss with candidate sampling
+# because of huge vocab
+class Wikipedia(object):
+    def __init__(self, inputs):
+        vocab_size = inputs.vocab_size
+        embedding_size = inputs.embedding_size
+        num_units = inputs.num_units
+        learning_rate = inputs.learning_rate
+        num_sampled = inputs.num_sampled
+        num_true = inputs.num_true
+        with tf.variable_scope("embedding"):
+            embed = tf.get_variable(name="embedding",
+                                    shape=[vocab_size, embedding_size],
+                                    initializer=tf.truncated_normal_initializer(stddev=0.05),
+                                    dtype=tf.float32)
+            lookup = tf.nn.embedding_lookup(embed, inputs.contexts)
+        with tf.variable_scope("rnn"):
+            lstm = tf.nn.rnn_cell.BasicLSTMCell(num_units=num_units, state_is_tuple=True)
+            outputs, _ = tf.nn.dynamic_rnn(cell=lstm,
+                                           inputs=lookup,
+                                           sequence_length=inputs.sequence_lengths,
+                                           dtype=tf.float32)
+            batch_size = outputs.get_shape().as_list()[0]
+            reshape = tf.reshape(outputs, [-1, num_units])
+        with tf.variable_scope("loss"):
+            softmax_w = tf.get_variable(name="softmax_w",
+                                        shape=[vocab_size, num_units],
+                                        initializer=tf.truncated_normal_initializer(stddev=0.05),
+                                        dtype=tf.float32)
+            softmax_b = tf.get_variable(name="softmax_b",
+                                        shape=[vocab_size],
+                                        initializer=tf.constant_initializer(value=0.),
+                                        dtype=tf.float32)
+            nce_loss = tf.nn.nce_loss(weights=softmax_w,
+                                      biases=softmax_b,
+                                      inputs=reshape,
+                                      labels=inputs.labels,
+                                      num_classes=vocab_size,
+                                      num_sampled=num_sampled,
+                                      num_true=num_true)
+            mask = tf.sign(inputs.labels)
+            fake_loss = tf.mul(tf.reshape(nce_loss, [batch_size, -1]), mask)
+            loss_per_example_sum = tf.reduce_sum(fake_loss, reduction_indices=1)
+            loss_per_example_average = tf.div(x=loss_per_example_sum,
+                                              y=tf.cast(inputs.sequence_lengths))
+            self.__loss = tf.reduce_mean(loss_per_example_average, name="loss")
+            with tf.name_scope("train"):
+                optimizer = tf.train.AdamOptimizer(learning_rate=learning_rate)
+                self.__train_op = optimizer.minimize(self.__loss)
+
+    @property
+    def loss(self):
+        return self.__loss
+
+    @property
+    def train_op(self):
+        return self.__train_op
+
+
